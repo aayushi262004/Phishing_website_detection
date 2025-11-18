@@ -1,0 +1,24 @@
+{
+  "model_type": "3-Branch Multi-Modal Phishing Detector",
+  "branches": {
+    "url_branch": {
+      "features": 40,
+      "purpose": "URL structure analysis"
+    },
+    "dom_branch": {
+      "features": 59,
+      "purpose": "DOM and content analysis"
+    },
+    "network_branch": {
+      "features": 14,
+      "purpose": "Network and security analysis"
+    }
+  },
+  "total_features": 113,
+  "training_date": "2025-11-17 21:36:31",
+  "performance": {
+    "final_auc": 0.986099898815155,
+    "final_accuracy": 0.9470543265342712,
+    "best_auc": 0.9866083860397339
+  }
+}
