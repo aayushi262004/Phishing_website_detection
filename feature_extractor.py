@@ -1,18 +1,23 @@
 # feature_extractor.py
 # Strict/full feature extractor to match feature_groups.pkl
-# Requires: requests, tldextract, python-whois, dnspython
+# Requires: requests, tldextract, python-whois, dnspython, bs4 (BeautifulSoup)
 # Optional (better ASN): ipwhois
 import re
 import socket
 import ssl
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
+import time
 
 import dns.resolver
 import pandas as pd
 import requests
 import tldextract
+from bs4 import BeautifulSoup # Required for DOM feature extraction
 
+# --- SMOKE TEST: CONFIRM THIS FILE IS LOADED ---
+print("--- FEATURE EXTRACTOR V5 LOADED ---")
+# ----------------------------------------------
 # Try optional ipwhois for ASN lookup
 try:
     from ipwhois import IPWhois
@@ -24,6 +29,8 @@ except Exception:
 # Helper utilities
 # -------------------------
 SHORTENERS = ["bit.ly", "goo.gl", "tinyurl", "t.co", "ow.ly", "is.gd", "buff.ly", "adf.ly"]
+VOWELS = "aeiou"
+CONSONANTS = "bcdfghjklmnpqrstvwxyz"
 
 def safe_get(obj, key, default=None):
     try:
@@ -81,16 +88,17 @@ def extract_url_features(url):
     features["qty_hashtag_url"] = count_chars(full_url, "#")
     features["qty_dollar_url"] = count_chars(full_url, "$")
     features["qty_percent_url"] = count_chars(full_url, "%")
-    # tld presence in the end of url (approx)
-    features["qty_tld_url"] = 1 if parsed.path.endswith("." + (tldextract.extract(full_url).suffix or "")) else 0
+
+    ext = tldextract.extract(full_url)
+    features["qty_tld_url"] = 1 if parsed.path.endswith("." + (ext.suffix or "")) else 0
     features["length_url"] = len(full_url)
 
     # Domain-level char counts (domain string)
-    domain_str = domain or ""
+    domain_str = ext.fqdn or ""
     features["qty_dot_domain"] = count_chars(domain_str, ".")
     features["qty_hyphen_domain"] = count_chars(domain_str, "-")
     features["qty_underline_domain"] = count_chars(domain_str, "_")
-    features["qty_slash_domain"] = count_chars(domain_str, "/")   # usually 0 in domain
+    features["qty_slash_domain"] = count_chars(domain_str, "/")
     features["qty_questionmark_domain"] = count_chars(domain_str, "?")
     features["qty_equal_domain"] = count_chars(domain_str, "=")
     features["qty_at_domain"] = count_chars(domain_str, "@")
@@ -104,72 +112,215 @@ def extract_url_features(url):
     features["qty_hashtag_domain"] = count_chars(domain_str, "#")
     features["qty_dollar_domain"] = count_chars(domain_str, "$")
     features["qty_percent_domain"] = count_chars(domain_str, "%")
+
     # vowels in domain
-    features["qty_vowels_domain"] = sum(1 for c in domain_str.lower() if c in "aeiou")
+    features["qty_vowels_domain"] = sum(1 for c in domain_str.lower() if c in VOWELS)
+
     # server_client_domain: heuristic -> 1 if domain looks like server/client keywords present
     features["server_client_domain"] = 1 if any(x in domain_str.lower() for x in ["server", "client", "gateway", "admin", "mail"]) else 0
 
-    # domain_length and domain_in_ip will be handled in DOM extractor (they belong to dom_features in feature_groups)
-
-    # time_domain_activation/time_domain_expiration included here because they are also listed in url_features
-    # But actual values will be computed in network extractor to avoid duplication; set None here, will be filled later
-    features["time_domain_activation"] = None
-    features["time_domain_expiration"] = None
+    # time_domain_activation/time_domain_expiration are computed in network but default here
+    features["time_domain_activation"] = -1
+    features["time_domain_expiration"] = -1
 
     return features
 
 # -------------------------
-# DOM / path / file / params features
+# HTML content features (Requires web scraping)
 # -------------------------
-def extract_dom_features(url):
+def _extract_html_features(response, domain, url):
+    features = {}
+
+    # Define ALL expected HTML-derived features and set safe defaults
+    html_derived_features = [
+        'phish_hints', 'contains_form', 'contains_iframe', 'qty_external_iframe', 'qty_external_scripts',
+        'qty_external_images', 'qty_external_css', 'qty_external_favicons', 'in_out_image', 'in_out_css',
+        'in_out_favicon', 'in_out_form', 'in_out_script', 'qty_divs', 'qty_iframes', 'qty_inputs',
+        'qty_scripts', 'qty_labels', 'qty_embeds', 'qty_objects', 'qty_external_links', 'qty_internal_links',
+        'qty_hyperlinks', 'ratio_intMedia', 'ratio_extMedia', 'ratio_intHyperlinks', 'ratio_extHyperlinks',
+        'ratio_intErrors', 'ratio_extErrors', 'ratio_error', 'login_present', 'external_favicon',
+        'url_ip_present', 'tld_present_in_title', 'script_in_body', 'qty_char_set', 'vowel_consonant_ratio',
+        'domain_in_body', 'url_in_body', 'domain_in_title', 'url_in_title', 'content_length'
+    ]
+
+    # Initialize all 41 features to defaults (0 for counts/ratios, -1 for length)
+    for key in html_derived_features:
+        if 'ratio' in key or 'length' == key or key in ['content_length']:
+            features[key] = -1.0 if 'length' in key else 0.0
+        else:
+            features[key] = 0
+
+    if response is None or response.status_code != 200:
+        return features # Return initialized defaults if request failed
+
+    try:
+        soup = BeautifulSoup(response.content, 'html.parser')
+    except Exception:
+        return features # Return initialized defaults if parsing fails
+
+    # Calculate actual features
+
+    # Basic Counts
+    features['qty_divs'] = len(soup.find_all('div'))
+    features['qty_iframes'] = len(soup.find_all('iframe'))
+    features['qty_inputs'] = len(soup.find_all('input'))
+    features['qty_scripts'] = len(soup.find_all('script'))
+    features['qty_labels'] = len(soup.find_all('label'))
+    features['qty_embeds'] = len(soup.find_all('embed'))
+    features['qty_objects'] = len(soup.find_all('object'))
+
+    # Content Length
+    try:
+        features['content_length'] = len(response.text)
+    except:
+        features['content_length'] = -1
+
+    # Phishing Hints (Naive check)
+    phish_keywords = ["login", "signin", "account", "verify", "update", "password", "bank"]
+    body_text = soup.body.get_text() if soup.body else ""
+    features['phish_hints'] = 1 if any(k in body_text.lower() for k in phish_keywords) else 0
+
+    # Forms and login fields
+    features['contains_form'] = 1 if soup.find('form') else 0
+    features['login_present'] = 1 if soup.find('input', {'type': 'password'}) else 0
+
+    # Character set (crude check)
+    features['qty_char_set'] = len(response.encoding or 'utf-8')
+
+    # Textual analysis
+    vowels_count = sum(1 for c in body_text.lower() if c in VOWELS)
+    consonants_count = sum(1 for c in body_text.lower() if c in CONSONANTS)
+    features['vowel_consonant_ratio'] = vowels_count / (consonants_count + 1e-6)
+
+    # Internal/External Link Analysis
+    all_links = soup.find_all(['a', 'link', 'script', 'img', 'iframe'])
+
+    counts = {
+        'external_links': 0, 'internal_links': 0, 'hyperlinks': 0,
+        'external_iframe': 0, 'external_scripts_calc': 0, 'external_images_calc': 0,
+        'external_css_calc': 0, 'external_favicons_calc': 0,
+        'internal_media': 0, 'external_media': 0, 'internal_css': 0,
+        'internal_favicon': 0, 'internal_form': 0, 'external_form': 0,
+        'internal_script': 0,
+    }
+
+    # Helper function to check if a URL is external
+    def is_external(href, current_domain):
+        if not href or href.startswith(('#', 'mailto:', 'tel:')): return False
+        try:
+            link_domain = extract_domain(href)
+            return link_domain and link_domain != current_domain
+        except:
+            return False
+
+    for tag in all_links:
+        src = tag.get('src') or tag.get('href')
+        if not src: continue
+
+        is_ext = is_external(src, domain)
+
+        # Hyperlinks (A tags)
+        if tag.name == 'a':
+            counts['hyperlinks'] += 1
+            if is_ext:
+                counts['external_links'] += 1
+            else:
+                counts['internal_links'] += 1
+
+        # Scripts
+        elif tag.name == 'script':
+            if is_ext:
+                counts['external_scripts_calc'] += 1
+
+        # Images/Media
+        elif tag.name == 'img' or tag.name == 'embed' or tag.name == 'object':
+            if is_ext:
+                counts['external_media'] += 1
+            else:
+                counts['internal_media'] += 1
+
+        # CSS (Link tags with rel=stylesheet)
+        elif tag.name == 'link' and tag.get('rel') == ['stylesheet']:
+            if is_ext:
+                counts['external_css_calc'] += 1
+            else:
+                counts['internal_css'] += 1
+
+        # Favicon
+        elif tag.name == 'link' and 'icon' in (tag.get('rel') or []):
+            if is_ext:
+                counts['external_favicons_calc'] += 1
+            else:
+                counts['internal_favicon'] += 1
+
+        # iFrames
+        elif tag.name == 'iframe':
+             if is_ext:
+                counts['external_iframe'] += 1
+
+    # Map calculated counts to feature names
+    features['qty_external_iframe'] = counts['external_iframe']
+    features['qty_external_scripts'] = counts['external_scripts_calc']
+    features['qty_external_images'] = counts['external_media']
+    features['qty_external_css'] = counts['external_css_calc']
+    features['qty_external_favicons'] = counts['external_favicons_calc']
+    features['qty_external_links'] = counts['external_links']
+    features['qty_internal_links'] = counts['internal_links']
+    features['qty_hyperlinks'] = counts['hyperlinks']
+
+    # Ratios
+    total_media = counts['internal_media'] + counts['external_media']
+    total_hyperlinks = counts['external_links'] + counts['internal_links']
+
+    features['ratio_intMedia'] = counts['internal_media'] / (total_media + 1e-6)
+    features['ratio_extMedia'] = counts['external_media'] / (total_media + 1e-6)
+    features['ratio_intHyperlinks'] = counts['internal_links'] / (total_hyperlinks + 1e-6)
+    features['ratio_extHyperlinks'] = counts['external_links'] / (total_hyperlinks + 1e-6)
+
+    # In/Out Ratios (Heuristics based on total internal/external resources/forms/scripts)
+    features['in_out_image'] = 1 if counts['external_media'] > counts['internal_media'] else 0
+    features['in_out_css'] = 1 if counts['external_css_calc'] > counts['internal_css'] else 0
+    features['in_out_favicon'] = 1 if counts['external_favicons_calc'] > counts['internal_favicon'] else 0
+
+    # Forms and Scripts are external if links are external
+    form_tag = soup.find('form')
+    features['in_out_form'] = 1 if form_tag and is_external(form_tag.get('action'), domain) else 0
+    script_tag = soup.find('script')
+    features['in_out_script'] = 1 if script_tag and is_external(script_tag.get('src'), domain) else 0
+
+    # Simple checks
+    features['external_favicon'] = features['qty_external_favicons'] > 0
+    features['script_in_body'] = 1 if soup.body and soup.body.find('script') else 0
+
+    # URL/Domain presence in title/body
+    ext = tldextract.extract(url)
+    title_text = soup.title.string.lower() if soup.title and soup.title.string else ""
+    body_plain_text = soup.body.get_text().lower() if soup.body else ""
+
+    features['domain_in_body'] = 1 if domain.lower() in body_plain_text else 0
+    features['url_in_body'] = 1 if url.lower() in body_plain_text else 0
+    features['domain_in_title'] = 1 if domain.lower() in title_text else 0
+    features['url_in_title'] = 1 if url.lower() in title_text else 0
+    features['tld_present_in_title'] = 1 if ext.suffix in title_text else 0
+
+    # Placeholder features (Errors and Google Index are hard to implement reliably without external services/access)
+    features['url_ip_present'] = features.get('domain_in_ip', 0) # Use the value calculated in URL-only
+
+    # Note: ratio_intErrors, ratio_extErrors, ratio_error remain 0.0 defaults
+
+    return features
+
+
+# -------------------------
+# DOM / path / file / params features (URL-derived only)
+# -------------------------
+def extract_dom_features_url_only(url):
     parsed = urlparse(url if url.startswith(("http://", "https://")) else "http://" + url)
-    path = parsed.path or ""
     query = parsed.query or ""
-    file_part = path.split("/")[-1] if path else ""
-    directories = "/".join([p for p in path.split("/")[:-1] if p != ""])
 
     features = {}
-    # directory counts
-    features["qty_dot_directory"] = count_chars(directories, ".")
-    features["qty_hyphen_directory"] = count_chars(directories, "-")
-    features["qty_underline_directory"] = count_chars(directories, "_")
-    features["qty_slash_directory"] = count_chars(directories, "/")
-    features["qty_questionmark_directory"] = count_chars(directories, "?")
-    features["qty_equal_directory"] = count_chars(directories, "=")
-    features["qty_at_directory"] = count_chars(directories, "@")
-    features["qty_and_directory"] = count_chars(directories, "&")
-    features["qty_exclamation_directory"] = count_chars(directories, "!")
-    features["qty_space_directory"] = count_chars(directories, " ")
-    features["qty_tilde_directory"] = count_chars(directories, "~")
-    features["qty_comma_directory"] = count_chars(directories, ",")
-    features["qty_plus_directory"] = count_chars(directories, "+")
-    features["qty_asterisk_directory"] = count_chars(directories, "*")
-    features["qty_hashtag_directory"] = count_chars(directories, "#")
-    features["qty_dollar_directory"] = count_chars(directories, "$")
-    features["qty_percent_directory"] = count_chars(directories, "%")
-    features["directory_length"] = len(directories)
 
-    # file counts
-    features["qty_dot_file"] = count_chars(file_part, ".")
-    features["qty_hyphen_file"] = count_chars(file_part, "-")
-    features["qty_underline_file"] = count_chars(file_part, "_")
-    features["qty_slash_file"] = count_chars(file_part, "/")
-    features["qty_questionmark_file"] = count_chars(file_part, "?")
-    features["qty_equal_file"] = count_chars(file_part, "=")
-    features["qty_at_file"] = count_chars(file_part, "@")
-    features["qty_and_file"] = count_chars(file_part, "&")
-    features["qty_exclamation_file"] = count_chars(file_part, "!")
-    features["qty_space_file"] = count_chars(file_part, " ")
-    features["qty_tilde_file"] = count_chars(file_part, "~")
-    features["qty_comma_file"] = count_chars(file_part, ",")
-    features["qty_plus_file"] = count_chars(file_part, "+")
-    features["qty_asterisk_file"] = count_chars(file_part, "*")
-    features["qty_hashtag_file"] = count_chars(file_part, "#")
-    features["qty_dollar_file"] = count_chars(file_part, "$")
-    features["qty_percent_file"] = count_chars(file_part, "%")
-    features["file_length"] = len(file_part)
-
-    # params counts
+    # params counts (17 character counts + qty_params)
     features["qty_dot_params"] = count_chars(query, ".")
     features["qty_hyphen_params"] = count_chars(query, "-")
     features["qty_underline_params"] = count_chars(query, "_")
@@ -187,21 +338,10 @@ def extract_dom_features(url):
     features["qty_hashtag_params"] = count_chars(query, "#")
     features["qty_dollar_params"] = count_chars(query, "$")
     features["qty_percent_params"] = count_chars(query, "%")
-    features["params_length"] = len(query)
-    # tld present in params (naive check)
-    features["tld_present_params"] = 1 if re.search(r"\.(" + r"|".join([
-        "com","org","net","in","co","edu","gov","info","biz","io","me","app"
-    ]) + r")", query) else 0
-    # number of params
-    try:
-        features["qty_params"] = len(parse_qs(query))
-    except Exception:
-        features["qty_params"] = 0
 
-    # email in URL
-    features["email_in_url"] = 1 if re.search(r"[A-Za-z0-9\._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", (parsed.netloc + parsed.path + query)) else 0
+    features["qty_params"] = len(parse_qs(query))
 
-    # domain_length and domain_in_ip moved to DOM group (compute here)
+    # domain_length and domain_in_ip
     domain = extract_domain(url)
     features["domain_length"] = len(domain)
     features["domain_in_ip"] = 1 if is_ip_string(domain) else 0
@@ -216,7 +356,7 @@ def extract_network_features(url, timeout=4.0):
     domain = extract_domain(full_url)
 
     features = {}
-    # default initial values
+    # default initial values (must match the 14 features exactly)
     features["time_response"] = -1.0
     features["domain_spf"] = 0
     features["asn_ip"] = -1
@@ -225,21 +365,23 @@ def extract_network_features(url, timeout=4.0):
     features["qty_ip_resolved"] = 0
     features["qty_nameservers"] = 0
     features["qty_mx_servers"] = 0
-    features["ttl_hostname"] = -1
-    features["tls_ssl_certificate"] = 0
+    features["ttl_a_record"] = -1 # Matches name in feature list (was ttl_hostname in calc)
+    features["url_accessible"] = 0 # Matches name in feature list (was tls_ssl_certificate in calc)
     features["qty_redirects"] = 0
-    features["url_google_index"] = 0
-    features["domain_google_index"] = 0
+    features["url_google_index"] = 0 # Placeholder: Hard to calculate reliably
+    features["domain_google_index"] = 0 # Placeholder: Hard to calculate reliably
     features["url_shortened"] = 1 if any(s in domain for s in SHORTENERS) else 0
 
     # Response and redirects via requests
+    r = None
     try:
-        r = requests.get(full_url, timeout=timeout, allow_redirects=True)
-        features["time_response"] = getattr(r.elapsed, "total_seconds", lambda: None)() if r.elapsed is not None else -1.0
+        start_time = time.time()
+        r = requests.get(full_url, timeout=timeout, allow_redirects=True, verify=False)
+        features["time_response"] = time.time() - start_time
         features["qty_redirects"] = len(r.history) if hasattr(r, "history") else 0
-    except Exception:
-        # keep defaults
-        pass
+        features["url_accessible"] = 1 # Mark as accessible if request was successful
+    except requests.exceptions.RequestException:
+        pass # keep defaults
 
     # WHOIS: domain dates
     try:
@@ -248,46 +390,34 @@ def extract_network_features(url, timeout=4.0):
         creation = safe_get(w, "creation_date", None)
         expiration = safe_get(w, "expiration_date", None)
 
-        # normalize lists
-        if isinstance(creation, list) and creation:
-            creation = creation[0]
-        if isinstance(expiration, list) and expiration:
-            expiration = expiration[0]
+        if isinstance(creation, list) and creation: creation = creation[0]
+        if isinstance(expiration, list) and expiration: expiration = expiration[0]
 
-        if isinstance(creation, datetime):
-            features["time_domain_activation"] = (datetime.now() - creation).days
-        if isinstance(expiration, datetime):
-            features["time_domain_expiration"] = (expiration - datetime.now()).days
+        if isinstance(creation, datetime): features["time_domain_activation"] = (datetime.now() - creation).days
+        if isinstance(expiration, datetime): features["time_domain_expiration"] = (expiration - datetime.now()).days
     except Exception:
-        # keep defaults
-        pass
+        pass # keep defaults
 
     # DNS queries
     try:
         ans_a = dns.resolver.resolve(domain, "A")
         features["qty_ip_resolved"] = len(ans_a)
-        # attempt to get TTL from rrset
         try:
-            features["ttl_hostname"] = ans_a.rrset.ttl
-        except Exception:
-            features["ttl_hostname"] = -1
+            # Storing the actual calculated value in a temporary key
+            ttl_val = ans_a.rrset.ttl
+            features["ttl_a_record"] = ttl_val
+        except Exception: features["ttl_a_record"] = -1
     except Exception:
         features["qty_ip_resolved"] = 0
-        features["ttl_hostname"] = -1
+        features["ttl_a_record"] = -1
 
-    try:
-        ans_ns = dns.resolver.resolve(domain, "NS")
-        features["qty_nameservers"] = len(ans_ns)
-    except Exception:
-        features["qty_nameservers"] = 0
+    try: features["qty_nameservers"] = len(dns.resolver.resolve(domain, "NS"))
+    except Exception: features["qty_nameservers"] = 0
 
-    try:
-        ans_mx = dns.resolver.resolve(domain, "MX")
-        features["qty_mx_servers"] = len(ans_mx)
-    except Exception:
-        features["qty_mx_servers"] = 0
+    try: features["qty_mx_servers"] = len(dns.resolver.resolve(domain, "MX"))
+    except Exception: features["qty_mx_servers"] = 0
 
-    # domain_spf: check for SPF-like TXT records containing "v=spf1"
+    # domain_spf
     try:
         txts = dns.resolver.resolve(domain, "TXT")
         txts_joined = " ".join([t.to_text().strip('"') for t in txts])
@@ -295,126 +425,61 @@ def extract_network_features(url, timeout=4.0):
     except Exception:
         features["domain_spf"] = 0
 
-    # SSL certificate presence (try connecting to port 443)
+    # SSL certificate presence (Optional check, but useful for url_accessible context)
     try:
         ctx = ssl.create_default_context()
         with ctx.wrap_socket(socket.socket(), server_hostname=domain) as s:
             s.settimeout(3)
             s.connect((domain, 443))
-            cert = s.getpeercert()
-            # if certificate returned, mark 1
-            features["tls_ssl_certificate"] = 1
+            s.getpeercert()
+            # If we successfully get cert, that's another indicator of accessibility
     except Exception:
-        features["tls_ssl_certificate"] = 0
+        pass
 
-    # ASN lookup: try ipwhois if installed, otherwise fallback to simple IP -> -1 or IP integer
+    # ASN lookup
     try:
-        # get IP from DNS A
         ip_addr = None
-        try:
-            answers = dns.resolver.resolve(domain, "A")
-            if answers:
-                ip_addr = answers[0].to_text()
-        except Exception:
-            try:
-                ip_addr = socket.gethostbyname(domain)
-            except Exception:
-                ip_addr = None
+        try: ip_addr = dns.resolver.resolve(domain, "A")[0].to_text()
+        except Exception: ip_addr = socket.gethostbyname(domain) if not is_ip_string(domain) else domain
 
         if _HAS_IPWHOIS and ip_addr:
-            try:
-                obj = IPWhois(ip_addr)
-                res = obj.lookup_rdap(asn_methods=["whois"])
-                asn = safe_get(res, "asn", None)
-                features["asn_ip"] = int(asn) if asn and str(asn).isdigit() else -1
-            except Exception:
-                features["asn_ip"] = -1
+            obj = IPWhois(ip_addr)
+            res = obj.lookup_rdap(asn_methods=["whois"], inc_raw=False)
+            asn = safe_get(res, "asn", -1)
+            features["asn_ip"] = int(asn) if asn and str(asn).isdigit() else -1
         else:
-            # fallback: store integer conversion of last octet or -1
-            if ip_addr:
-                try:
-                    parts = ip_addr.split(".")
-                    features["asn_ip"] = int(parts[-1])
-                except Exception:
-                    features["asn_ip"] = -1
+            if ip_addr and not is_ip_string(domain):
+                features["asn_ip"] = int(ip_addr.split(".")[-1])
             else:
                 features["asn_ip"] = -1
     except Exception:
         features["asn_ip"] = -1
 
-    return features
+    return features, r
 
 # -------------------------
 # MASTER: combine all features into a single-row dataframe
 # -------------------------
 def extract_all_features(url):
-    """
-    Returns a pandas DataFrame with exactly the feature names used by the model.
-    NOTE: Order of columns is not guaranteed here — calling code should reindex
-    using feature_groups loaded from disk (feature_groups.pkl) to align order.
-    """
-    # gather parts
     u = extract_url_features(url)
-    d = extract_dom_features(url)
-    n = extract_network_features(url)
+    d_url = extract_dom_features_url_only(url)
+    n, response = extract_network_features(url)
 
-    # Merge dictionaries; network WHOIS computed time_domain_* should be used.
-    # ensure time_domain values propagate to url & dom dictionaries for consistency
-    if n.get("time_domain_activation", None) is not None and n.get("time_domain_activation", -1) != -1:
-        u["time_domain_activation"] = n["time_domain_activation"]
-    if n.get("time_domain_expiration", None) is not None and n.get("time_domain_expiration", -1) != -1:
-        u["time_domain_expiration"] = n["time_domain_expiration"]
+    # Domain features derived from HTML content (41 features)
+    d_html = _extract_html_features(response, extract_domain(url), url)
 
-    # if dom expects domain_length/domain_in_ip, they are computed in dom extractor already
-
+    # Merge dictionaries
     all_feat = {}
     all_feat.update(u)
-    all_feat.update(d)
+    all_feat.update(d_url)
+    all_feat.update(d_html)
     all_feat.update(n)
 
-    # Make sure every feature referenced in your feature_groups exists (create safe defaults)
-    required = [
-        # url_features (as in feature_groups.pkl)
-        'qty_dot_url','qty_hyphen_url','qty_underline_url','qty_slash_url','qty_questionmark_url',
-        'qty_equal_url','qty_at_url','qty_and_url','qty_exclamation_url','qty_space_url',
-        'qty_tilde_url','qty_comma_url','qty_plus_url','qty_asterisk_url','qty_hashtag_url',
-        'qty_dollar_url','qty_percent_url','qty_tld_url','length_url','qty_dot_domain',
-        'qty_hyphen_domain','qty_underline_domain','qty_slash_domain','qty_questionmark_domain',
-        'qty_equal_domain','qty_at_domain','qty_and_domain','qty_exclamation_domain','qty_space_domain',
-        'qty_tilde_domain','qty_comma_domain','qty_plus_domain','qty_asterisk_domain','qty_hashtag_domain',
-        'qty_dollar_domain','qty_percent_domain','qty_vowels_domain','server_client_domain',
-        'time_domain_activation','time_domain_expiration',
-        # dom_features
-        'qty_dot_directory','qty_hyphen_directory','qty_underline_directory','qty_slash_directory',
-        'qty_questionmark_directory','qty_equal_directory','qty_at_directory','qty_and_directory',
-        'qty_exclamation_directory','qty_space_directory','qty_tilde_directory','qty_comma_directory',
-        'qty_plus_directory','qty_asterisk_directory','qty_hashtag_directory','qty_dollar_directory',
-        'qty_percent_directory','directory_length','qty_dot_file','qty_hyphen_file','qty_underline_file',
-        'qty_slash_file','qty_questionmark_file','qty_equal_file','qty_at_file','qty_and_file',
-        'qty_exclamation_file','qty_space_file','qty_tilde_file','qty_comma_file','qty_plus_file',
-        'qty_asterisk_file','qty_hashtag_file','qty_dollar_file','qty_percent_file','file_length',
-        'qty_dot_params','qty_hyphen_params','qty_underline_params','qty_slash_params',
-        'qty_questionmark_params','qty_equal_params','qty_at_params','qty_and_params',
-        'qty_exclamation_params','qty_space_params','qty_tilde_params','qty_comma_params',
-        'qty_plus_params','qty_asterisk_params','qty_hashtag_params','qty_dollar_params',
-        'qty_percent_params','params_length','tld_present_params','qty_params','email_in_url',
-        'domain_length','domain_in_ip',
-        # network_features
-        'time_response','domain_spf','asn_ip','time_domain_activation','time_domain_expiration',
-        'qty_ip_resolved','qty_nameservers','qty_mx_servers','ttl_hostname','tls_ssl_certificate',
-        'qty_redirects','url_google_index','domain_google_index','url_shortened'
-    ]
-
-    # fill missing with safe defaults
-    for r in required:
-        if r not in all_feat:
-            # choose sensible default: numeric 0 or -1 for unknowns
-            if any(x in r for x in ["time_", "ttl", "asn", "time_domain"]):
-                all_feat[r] = -1
-            else:
-                all_feat[r] = 0
+    # Propagate WHOIS dates to URL group features
+    if 'time_domain_activation' in n and n['time_domain_activation'] != -1:
+        all_feat["time_domain_activation"] = n["time_domain_activation"]
+    if 'time_domain_expiration' in n and n['time_domain_expiration'] != -1:
+        all_feat["time_domain_expiration"] = n["time_domain_expiration"]
 
     # Return dataframe with one row
-    df = pd.DataFrame([all_feat])
-
-    return df
+    return pd.DataFrame([all_feat])
